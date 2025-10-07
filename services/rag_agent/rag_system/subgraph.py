@@ -74,7 +74,7 @@ def create_rag_subgraph(
     agent_node = create_agent_node(llm, tools)
 
     # Build and compile workflow
-    workflow = build_workflow(agent_node)
+    workflow = build_workflow(agent_node, name)
 
     log(f"RAG subgraph '{name}' created successfully")
     return workflow

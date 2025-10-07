@@ -4,7 +4,7 @@ from langgraph.graph import END, StateGraph
 from .state import GraphState
 
 
-def build_workflow(agent_node: Callable) -> StateGraph:
+def build_workflow(agent_node: Callable, name: str) -> StateGraph:
     """Build the LangGraph workflow with a single ReAct agent node.
 
     This creates a minimal workflow with:
@@ -17,6 +17,7 @@ def build_workflow(agent_node: Callable) -> StateGraph:
 
     Args:
         agent_node: The ReAct agent node function
+        name: The name for the compiled graph
 
     Returns:
         Compiled StateGraph ready for execution
@@ -34,4 +35,4 @@ def build_workflow(agent_node: Callable) -> StateGraph:
 
     # Compile with increased recursion limit for complex ReAct reasoning
     # The agent may need multiple tool calls (router → retrieve → evaluate → answer)
-    return workflow.compile()
+    return workflow.compile(name=name)

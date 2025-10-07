@@ -43,7 +43,7 @@ flowchart TD
   3. **任務分派**：根據 `todo_list` 的內容，將具體任務（如「查詢資料」或「建立 DATCOM」）分派給對應的 Worker Agent。  
   4. **最終回覆**：在所有任務完成後，整理 Worker Agent 的回報，生成最終的答覆給使用者。
 
-### **2.2. RAG Agent (`agent/rag_agent/`)**
+### **2.2. RAG Agent (`services/rag_agent/`)**
 
 * **類型**：已存在的 LangGraph 子圖 (Subgraph)，被視為一個獨立的 Worker Agent。  
 * **職責**：  
@@ -70,9 +70,11 @@ flowchart TD
 .  
 ├── agent/  
 │   ├── supervisor.py         \# 主要的 Supervisor Graph，會匯出 app  
-│   ├── datcom\_agent.py       \# DatcomAgent 的客製化 StateGraph  
-│   └── rag\_agent/            \# Agentic RAG 子圖的資料夾  
-│       └── ...               \# (已存在的 subgraph 檔案)  
+│   └── datcom\_agent.py       \# DatcomAgent 的客製化 StateGraph  
+│
+├── services/
+│   └── rag_agent/            \# Agentic RAG 子圖的資料夾
+│       └── ...               \# (已存在的 subgraph 檔案)
 │  
 ├── node/  
 │   ├── datcom\_nodes.py       \# DatcomAgent 內部使用的所有節點函式  
