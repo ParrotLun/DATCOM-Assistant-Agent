@@ -4,7 +4,7 @@ services:
       context: ..
     container_name: rag_app
     env_file:
-      - ../../.env
+      - ../.env
     volumes:
       - ../:/app
     depends_on:

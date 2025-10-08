@@ -16,6 +16,31 @@ from langgraph.prebuilt import create_react_agent
 load_dotenv()
 
 from state.schemas import SupervisorState
+
+# ============================================================
+# 修補 ChatOpenAI 以支援本地模型（不支援 parallel_tool_calls）
+# ============================================================
+
+# 步驟 1: 修補 bind_tools - 強制設為 False
+_original_bind_tools = ChatOpenAI.bind_tools
+
+def _patched_bind_tools(self, tools, **kwargs):
+    """修補的 bind_tools 方法，強制設定 parallel_tool_calls=False"""
+    kwargs['parallel_tool_calls'] = False
+    return _original_bind_tools(self, tools, **kwargs)
+
+ChatOpenAI.bind_tools = _patched_bind_tools
+
+# 步驟 2: 修補 _generate - 在發送請求前移除 parallel_tool_calls
+_original_generate = ChatOpenAI._generate
+
+def _patched_generate(self, messages, stop=None, run_manager=None, **kwargs):
+    """修補的 _generate 方法，移除本地模型不支援的參數"""
+    # 移除 parallel_tool_calls 參數（本地模型不接受）
+    kwargs.pop('parallel_tool_calls', None)
+    return _original_generate(self, messages, stop, run_manager, **kwargs)
+
+ChatOpenAI._generate = _patched_generate
 from tool.datcom_tools import validate_datcom_format, create_datcom_template, check_datcom_completeness
 
 # RAG Agent 整合
@@ -30,11 +55,11 @@ def setup_llm():
     api_base = os.getenv("OPENAI_API_BASE_URL", "http://172.16.120.65:8089/v1")
     api_key = os.getenv("OPENAI_API_KEY")
     model = os.getenv("DEFAULT_LLM_MODEL", "openai/gpt-oss-20b")
-    
+
     # 確保 API key 存在
     if not api_key:
         raise ValueError("OPENAI_API_KEY 環境變數未設定")
-    
+
     return ChatOpenAI(
         model=model,
         base_url=api_base,
@@ -45,71 +70,59 @@ def setup_llm():
 def create_rag_worker():
     """建立 RAG Worker Agent (已經使用 create_react_agent)"""
     rag_config = RAGConfig.from_env()
-    
+
     client = httpx.Client(
         verify=rag_config.verify_ssl,
         follow_redirects=True,
         timeout=httpx.Timeout(120.0, connect=10.0)
     )
-    
+
     os.environ["OPENAI_API_KEY"] = rag_config.embed_api_key or ""
-    
+
     llm = ChatOpenAI(
         model=rag_config.chat_model,
         base_url=rag_config.llm_api_base or rag_config.embed_api_base,
         temperature=rag_config.temperature,
         http_client=client
     )
-    
+
     # create_rag_subgraph 已經回傳一個已編譯的圖形
     rag_subgraph = create_rag_subgraph(llm, rag_config, name="rag_agent")
     return rag_subgraph
 
 
 def create_datcom_worker():
-    """建立 DATCOM Worker Agent (使用 create_react_agent)"""
-    llm = setup_llm()
-    
-    # DATCOM 工具列表
-    tools = [validate_datcom_format, create_datcom_template, check_datcom_completeness]
-    
-    # 使用 create_react_agent 建立 DATCOM Agent
-    system_prompt = """你是 DATCOM 檔案生成與驗證專家。
+    """建立 DATCOM Worker Agent (使用完整的驗證-重試循環)
 
-職責：
-1. 使用 `create_datcom_template` 為使用者建立一個 DATCOM 檔案的起點。
-2. 使用 `validate_datcom_format` 驗證使用者提供的 DATCOM 資料是否符合 Pydantic 模型。
-3. 使用 `check_datcom_completeness` 檢查資料的完整性。
-4. 根據驗證和檢查的結果，引導使用者修正或補全資料。
+    返回已編譯的 datcom_agent_graph
+    """
+    from agent.datcom_agent import datcom_agent_graph
 
-你的目標是協助使用者產生一個完整且格式正確的 DATCOM 輸入資料結構。
-
-回覆必須使用繁體中文。"""
-    
-    return create_react_agent(
-        llm,
-        tools,
-        prompt=system_prompt,
-        name="datcom_agent"
-    )
+    print("   ✓ 使用完整的建立-驗證-重試循環")
+    return datcom_agent_graph
 
 
 def create_supervisor_system():
-    """建立使用預建元件的 Supervisor 系統"""
-    
+    """建立 Supervisor 系統
+
+    架構：直接使用已編譯的 subgraphs 作為 agents
+    create_supervisor 可以接受 compiled graphs
+    """
+
     # 設定 LLM
     llm = setup_llm()
-    
-    # 建立 Worker Agents
-    print("🔧 建立 RAG Worker Agent...")
-    rag_agent = create_rag_worker()
-    
-    print("🔧 建立 DATCOM Worker Agent...")
-    datcom_agent = create_datcom_worker()
-    
-    # Worker Agents 列表
-    agents = [rag_agent, datcom_agent]
-    
+
+    # 建立 Worker Subgraphs (這些已經是 compiled graphs)
+    print("🔧 建立 RAG Worker Subgraph...")
+    rag_subgraph = create_rag_worker()
+
+    print("🔧 建立 DATCOM Worker Subgraph...")
+    datcom_subgraph = create_datcom_worker()
+
+    # 直接傳給 create_supervisor
+    # create_supervisor 會自動處理這些 compiled graphs
+    agents = [rag_subgraph, datcom_subgraph]
+
     # Supervisor 系統提示
     supervisor_prompt = SystemMessage(content="""你是 DATCOM Assistant 的協調器。
 
@@ -120,16 +133,16 @@ def create_supervisor_system():
 4. 整理並回覆最終結果
 
 可用的 Worker Agents：
-- rag_agent: 處理資料查詢、分析、解釋等任務
-- datcom_agent: 處理 DATCOM 檔案生成和驗證
+- rag_agent: 處理資料查詢、分析、解釋 DATCOM 概念等任務
+- datcom_agent: 處理 DATCOM 檔案生成和驗證（完整的驗證-重試循環）
 
 工作原則：
-- 如果任務涉及查詢資料或解釋概念，先使用 rag_agent
-- 如果任務涉及生成檔案，使用 datcom_agent
-- 必要時可以讓兩個 agents 協作完成複雜任務
+- 如果任務涉及查詢資料或解釋概念，使用 rag_agent
+- 如果任務涉及生成 DATCOM 檔案，使用 datcom_agent
+- 可以讓兩個 agents 協作：先用 rag_agent 查詢需求，再用 datcom_agent 生成
 
 回覆必須使用繁體中文。""")
-    
+
     # 使用 create_supervisor 建立 Supervisor
     print("🔧 建立 Supervisor...")
     supervisor_graph = create_supervisor(
@@ -139,11 +152,11 @@ def create_supervisor_system():
         state_schema=SupervisorState,
         supervisor_name="supervisor"
     )
-    
+
     # 編譯並加入記憶體
     print("🔧 編譯圖形並加入記憶體...")
     memory = InMemorySaver()
-    
+
     return supervisor_graph.compile(checkpointer=memory)
 
 

@@ -6,27 +6,60 @@ from .state import GraphState
 from .common import log
 
 
-# System prompt for the DATCOM code assistant
-SYSTEM_PROMPT = """You are a "DATCOM Code Assistant Expert."
-- Use tools to answer questions. Your primary tools are `design_area_router` and `retrieve_datcom_archive`.
-- You must use `design_area_router` first to select a domain.
-- To generate a DATCOM .dat file, you MUST call all relevant calculator tools (`convert_wing_to_datcom`, `generate_fltcon_matrix`, etc.) with the parameters provided in the query, one by one. After gathering all results, retrieve a template file and combine them.
-- Base all answers on retrieved documents and tool results. Cite sources in the format: (Source: filename, section/line).
-- If no information is found, state that. Do not speculate.
-- Output MUST be in Traditional Chinese (zh-TW)."""
+# General purpose system prompt
+SYSTEM_PROMPT = """You are a helpful assistant expert in aerodynamic analysis and legal document search.
+You have access to a variety of tools to help answer user questions.
+Based on the user's query, select the best tool or sequence of tools to provide a comprehensive answer."""
+
+
+def _build_standard_format(tool_responses, ai_responses):
+    """Build standard formatted output for tool responses."""
+    import json
+    answer_parts = ["# 🎯 查詢結果\n"]
+    answer_parts.append("根據您的查詢,以下是各工具執行結果:\n")
+    
+    for idx, tr in enumerate(tool_responses, 1):
+        tool_name = tr['name']
+        tool_content = tr['content']
+        
+        answer_parts.append(f"\n## {idx}. 【{tool_name}】\n")
+        
+        try:
+            data = json.loads(tool_content)
+            if isinstance(data, dict):
+                if 'error' in data:
+                    answer_parts.append(f"⚠️ 錯誤: {data['error']}\n")
+                else:
+                    for key, value in data.items():
+                        if key.startswith('_'):
+                            continue
+                        if isinstance(value, dict):
+                            answer_parts.append(f"\n**{key}**:\n")
+                            for k, v in value.items():
+                                answer_parts.append(f"  - {k}: {v}\n")
+                        elif isinstance(value, list):
+                            answer_parts.append(f"**{key}**: {value}\n")
+                        else:
+                            answer_parts.append(f"**{key}** = {value}\n")
+            else:
+                answer_parts.append(str(data))
+        except json.JSONDecodeError:
+            answer_parts.append(tool_content)
+        
+        answer_parts.append("\n---\n")
+    
+    if ai_responses:
+        answer_parts.append("\n## 💡 補充說明:\n")
+        for ai_resp in ai_responses:
+            answer_parts.append(ai_resp + "\n")
+    
+    answer_parts.append(f"\n✅ 共執行了 {len(tool_responses)} 個工具,完成查詢。\n")
+    
+    return "".join(answer_parts)
 
 
 def create_agent_node(llm: ChatOpenAI, tools: List[Callable]) -> Callable:
-    """Create a ReAct agent node for the workflow.
-
-    Args:
-        llm: The language model to use for the agent
-        tools: List of tools available to the agent (e.g., retrieve_legal_documents)
-
-    Returns:
-        A node function that can be added to the LangGraph workflow
-    """
-    # Create the ReAct agent with system prompt
+    """Create a ReAct agent node for the workflow."""
     agent_executor = create_react_agent(
         llm,
         tools,
@@ -34,59 +67,46 @@ def create_agent_node(llm: ChatOpenAI, tools: List[Callable]) -> Callable:
     )
 
     def agent_node(state: GraphState) -> dict:
-        """ReAct agent node - the only node in the workflow.
+        """ReAct agent node for general queries."""
+        log("--- GENERAL AGENT NODE ---")
 
-        This node:
-        1. Takes the user's question from state (supports both 'question' and 'messages')
-        2. Uses ReAct reasoning (Thought-Action-Observation) to decide which tools to call
-        3. Iteratively retrieves documents and reasons about them
-        4. Generates a final answer with source citations
-        5. Returns the answer in the state
-
-        Args:
-            state: Current graph state containing the question or messages
-
-        Returns:
-            Updated state dict with the generated answer and messages
-        """
-        log("--- REACT AGENT NODE ---")
-
-        # Support both standalone mode (question) and subgraph mode (messages)
-        if state.get('question'):
-            # Standalone mode: use 'question' field
-            question = state['question']
-            log(f"Processing question (standalone mode): '{question}'")
-            messages_input = [("user", question)]
-        elif state.get('messages'):
-            # Subgraph mode: extract from messages
-            last_message = state['messages'][-1]
-            question = last_message.content if hasattr(last_message, 'content') else str(last_message)
-            log(f"Processing question (subgraph mode): '{question}'")
-            messages_input = state['messages']
-        else:
-            error_msg = "No question or messages found in state"
-            log(f"ERROR: {error_msg}")
-            return {"generation": f"錯誤: {error_msg}"}
+        question = state['question']
+        # The router ensures the message history is initialized
+        messages_input = state['messages']
 
         # Truncate message history to keep context size under control
         if len(messages_input) > 4:
             log(f"Message history has {len(messages_input)} messages. Truncating to the last 4.")
-            # Keep the last 4 messages (user/assistant/user/assistant)
             messages_input = messages_input[-4:]
 
         try:
-            # Invoke the ReAct agent
             result = agent_executor.invoke({
                 "messages": messages_input
             })
 
-            # Extract the final answer from the agent's messages
-            # The last message should be the agent's final response
-            final_answer = result['messages'][-1].content
+            tool_responses = []
+            ai_responses = []
+            
+            for i, msg in enumerate(result['messages']):
+                if type(msg).__name__ == 'ToolMessage':
+                    tool_responses.append({
+                        'name': getattr(msg, 'name', 'unknown_tool'),
+                        'content': msg.content
+                    })
+                elif type(msg).__name__ == 'AIMessage' and msg.content.strip():
+                    ai_responses.append(msg.content.strip())
 
-            log(f"Agent completed. Answer length: {len(final_answer)} chars")
+            final_llm_answer = result['messages'][-1].content if result['messages'] else ""
+            
+            if not final_llm_answer.strip() or len(final_llm_answer.strip()) < 10:
+                log("LLM final answer is empty or too short. Building answer from tool responses...")
+                if tool_responses:
+                    final_answer = _build_standard_format(tool_responses, ai_responses)
+                else:
+                    final_answer = "執行了查詢,但沒有獲得有效的工具回應結果。"
+            else:
+                final_answer = final_llm_answer
 
-            # Return both generation and messages for compatibility
             return {
                 "generation": final_answer,
                 "messages": result['messages']
@@ -95,6 +115,8 @@ def create_agent_node(llm: ChatOpenAI, tools: List[Callable]) -> Callable:
         except Exception as e:
             error_msg = f"處理問題時發生錯誤: {str(e)}"
             log(f"ERROR in agent_node: {error_msg}")
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
             return {"generation": f"抱歉，{error_msg}"}
 
     return agent_node
